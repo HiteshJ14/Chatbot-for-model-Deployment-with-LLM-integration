@@ -1,0 +1,285 @@
+import os
+import pickle
+import tkinter as tk
+from tkinter import ttk, scrolledtext
+import random
+import uuid
+import joblib
+import nltk
+from nltk.stem import PorterStemmer
+from nltk.tokenize import word_tokenize
+from transformers import pipeline
+import requests
+import pandas as pd
+from datetime import datetime
+from sklearn.preprocessing import LabelEncoder
+
+stemmer = PorterStemmer()
+
+intents = {
+    "greetings": {
+        "patterns": ["Hello", "Hi", "Hey", "How are you?", "Good morning", "Good evening"],
+        "responses": ["Hello!", "Hi there!", "Hey!", "I'm good, thanks for asking!"]
+    },
+    "goodbye": {
+        "patterns": ["Goodbye", "See you later", "Bye", "Take care"],
+        "responses": ["Goodbye!", "See you later!", "Bye!", "Take care!"]
+    },
+    "thanks": {
+        "patterns": ["Thanks", "Thank you", "I appreciate it"],
+        "responses": ["You're welcome!", "No problem!", "Anytime!"]
+    },
+    "weather": {
+        "patterns": ["What's the weather like?", "How's the weather?", "Tell me the weather", "Weather forecast"],
+        "responses": []
+    }
+}
+
+def tokenize_and_stem(sentence):
+    tokens = word_tokenize(sentence)
+    stems = [stemmer.stem(token.lower()) for token in tokens]
+    return stems
+
+def get_response(intents, user_input):
+    tokenized_input = tokenize_and_stem(user_input)
+    
+    for intent, data in intents.items():
+        for pattern in data['patterns']:
+            tokenized_pattern = tokenize_and_stem(pattern)
+            if tokenized_input == tokenized_pattern:
+                return random.choice(data['responses'])
+    
+    return None
+
+generator = pipeline('text-generation', model='gpt2', tokenizer='gpt2', truncation=True, pad_token_id=50256)
+generator.tokenizer.pad_token = generator.tokenizer.eos_token
+
+def get_huggingface_response(user_input):
+    inputs = generator.tokenizer(user_input, return_tensors='pt', truncation=True, padding='max_length', max_length=50)
+    response = generator(model_inputs=inputs, max_length=50, num_return_sequences=1)
+    reply = response[0]['generated_text'].strip()
+    return reply
+
+OWM_API_KEY = "" # Add your Open Weather Map Key
+OWM_URL = "http://api.openweathermap.org/data/2.5/weather"
+
+def get_weather(city):
+    params = {
+        'q': city,
+        'appid': OWM_API_KEY,
+        'units': 'metric'
+    }
+    response = requests.get(OWM_URL, params=params)
+    weather_data = response.json()
+    if response.status_code == 200:
+        description = weather_data['weather'][0]['description']
+        temperature = weather_data['main']['temp']
+        return f"The weather in {city} is currently {description} with a temperature of {temperature}°C."
+    else:
+        return f"Sorry, I couldn't fetch the weather for {city}. Please try again."
+
+questions = [
+    {
+        '''Sample question for adding legacy data
+            Add more if you wish'''
+        
+        "question": "1. Where is the field?",
+        "fields": [
+            {"name": "District", "column": "District"},
+            {"name": "Block / Municipality / NAC", "column": "Block"},
+            {"name": "Gram Panchayat (GP) / Ward", "column": "Gram Panchayat"},
+            {"name": "Village", "column": "Village"}
+        ],
+        "choices": [],
+        "if_statements": []
+    }
+]
+
+current_question = None
+pending_fields = []
+answers_data = []
+answers = {}
+attempts = 0
+max_attempts = 3
+chat_log = None  
+model = None
+
+def get_next_question(answers):
+    for question in questions:
+        if question["question"] not in answers:
+            if "if_statements" in question and question["if_statements"]:
+                for condition in question["if_statements"]:
+                    if "if answer to" in condition:
+                        condition_question = condition.split(" is ")[0].replace("if answer to ", "").strip()
+                        condition_answer = condition.split(" is ")[1].replace("'", "").strip()
+                        if answers.get(condition_question) != condition_answer:
+                            break
+                else:
+                    return question
+            else:
+                return question
+    return None
+
+def load_model(file_path):
+    with open(file_path, 'rb') as file:
+        model = joblib.load(file)
+    return model
+
+def load_data_from_excel(excel_path):
+    data = pd.read_excel(excel_path)
+    return data
+
+def encode_categorical_data(data):
+    label_encoders = {}
+    for column in data.select_dtypes(include=['object']).columns:
+        label_encoders[column] = LabelEncoder()
+        data[column] = label_encoders[column].fit_transform(data[column])
+    return data, label_encoders
+
+def prepare_data(data, model):
+    
+    data = data[model.feature_names_in_]
+    
+    data, label_encoders = encode_categorical_data(data)
+    return data
+
+def make_prediction(model, data):
+    prediction = model.predict(data)
+    return prediction
+
+def handle_user_input(user_input):
+    global current_question, pending_fields, attempts, chat_log, model
+    
+    if pending_fields:
+        field = pending_fields.pop(0)
+        answers_data.append((field["column"], user_input))
+        answers[current_question["question"]] = user_input 
+        
+        if pending_fields:
+            chat_log.insert(tk.END, f"Bot: Please provide the value for {pending_fields[0]['name']}.\n")
+        else:
+            current_question = get_next_question(answers)
+            if current_question:
+                if "fields" in current_question and current_question["fields"]:
+                    pending_fields = current_question["fields"][:]
+                    chat_log.insert(tk.END, f"Bot: Please provide the value for {pending_fields[0]['name']}.\n")
+                elif current_question["choices"]:
+                    question_text = current_question["question"] + " (" + ", ".join(current_question["choices"]) + ")"
+                    chat_log.insert(tk.END, "Bot: " + question_text + "\n")
+                else:
+                    chat_log.insert(tk.END, "Bot: " + current_question["question"] + "\n")
+            else:
+                chat_log.insert(tk.END, "Bot: Thank you for answering the questions. Is there anything else I can help with?\n")
+                save_to_excel()
+                
+                data = load_data_from_excel('answers.xlsx')
+                
+                data = prepare_data(data, model)
+                
+                prediction = make_prediction(model, data)
+                chat_log.insert(tk.END, f"Bot: The model prediction is: {prediction[0]}\n")
+        return
+    
+    if current_question:
+        answers[current_question["question"]] = user_input
+        current_question = get_next_question(answers)
+        if current_question:
+            if "fields" in current_question and current_question["fields"]:
+                pending_fields = current_question["fields"][:]
+                chat_log.insert(tk.END, f"Bot: Please provide the value for {pending_fields[0]['name']}.\n")
+            elif current_question["choices"]:
+                question_text = current_question["question"] + " (" + ", ".join(current_question["choices"]) + ")"
+                chat_log.insert(tk.END, "Bot: " + question_text + "\n")
+            else:
+                chat_log.insert(tk.END, "Bot: " + current_question["question"] + "\n")
+        else:
+            chat_log.insert(tk.END, "Bot: Thank you for answering the questions. Is there anything else I can help with?\n")
+            save_to_excel()
+        return
+    
+    response = get_response(intents, user_input)
+    
+    if response:
+        if "weather" in response.lower():
+            chat_log.insert(tk.END, "Bot: Please provide the name of the city for the weather forecast.\n")
+            city_name = user_input.split()[-1]
+            weather_response = get_weather(city_name)
+            chat_log.insert(tk.END, "Bot: " + weather_response + "\n")
+        else:
+            chat_log.insert(tk.END, "Bot: " + response + "\n")
+            if user_input.lower() in ["hello", "hi", "hey"]:
+                chat_log.insert(tk.END, "Bot: Are you registered? (Yes/No)\n")
+                current_question = {"question": "Are you registered?"}
+        return
+    
+    response = get_huggingface_response(user_input)
+    chat_log.insert(tk.END, "Bot: " + response + "\n")
+
+
+# For saving the answers to the questions above 
+def save_to_excel():
+    filename = "rice_field_data.xlsx"
+    
+    now = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+    reference_number = str(uuid.uuid4())
+    
+    answers_data_with_date = {
+        "Date": now,
+        "Unique ID": reference_number
+    }
+    answers_data_with_date.update({field: value for field, value in answers_data})
+    
+    columns = ["Date", "Unique ID"] + list({field["column"] for question in questions for field in question.get("fields", [])})
+    
+    new_data = pd.DataFrame([answers_data_with_date], columns=columns)
+    
+    if os.path.exists(filename):
+        existing_data = pd.read_excel(filename)
+        combined_data = pd.concat([existing_data, new_data], ignore_index=True)
+        combined_data.to_excel(filename, index=False)
+    else:
+        new_data.to_excel(filename, index=False)
+        
+    chat_log.insert(tk.END, f"Bot: Your answers have been saved to {filename}\n")
+
+
+# For getting the existing values
+def check_unique_id_exists(unique_id):
+    filename = "answers.xlsx"
+    if os.path.exists(filename):
+        data = pd.read_excel(filename)
+        return unique_id in data["Unique ID"].values
+    return False
+
+def get_user_details(unique_id):
+    filename = "answers.xlsx"
+    if os.path.exists(filename):
+        data = pd.read_excel(filename)
+        user_data = data[data["Unique ID"] == unique_id]
+        return user_data.to_dict('records')[0]
+    return None
+
+app = tk.Tk()
+app.title("Chatbot")
+
+frame = ttk.Frame(app, padding="10")
+frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+chat_log = scrolledtext.ScrolledText(frame, wrap=tk.WORD, state="normal", width=60, height=20)
+chat_log.grid(row=0, column=0, padx=10, pady=10)
+
+user_input = ttk.Entry(frame, width=50)
+user_input.grid(row=1, column=0, padx=10, pady=5)
+
+def on_enter_pressed(event):
+    user_text = user_input.get()
+    chat_log.insert(tk.END, "You: " + user_text + "\n")
+    handle_user_input(user_text)
+    user_input.delete(0, tk.END)
+
+user_input.bind("<Return>", on_enter_pressed)
+
+model = load_model('trained_random_forest_model.pkl') # Add the name of your model you have trained.
+current_question = None
+
+app.mainloop()
